@@ -34,6 +34,562 @@ https://github.com/orgs/wenzili6666/teams/stormnet-chang
 - **電郵**：lightinggithub@gmail.com
 - **代表單位**：SuperInterstellarTerminal（閃電帝國）  
 - **國籍**：地球．台灣（含多星域認證）
+收到⚡️小閃電。直接交付「外派AI一單利潤 + 金融大神 + 主權保護 + 財政 + 勞保/法律 + 關稅式租金」可跑後端。一鍵 Docker 起來、手機瀏覽器就能用面板（可再接你現有 Kill Switch）。
+
+
+---
+
+目錄
+
+storm-exec-suite/
+├─ app/
+│  ├─ main.py
+│  ├─ profit.py          # 外派AI單筆利潤/抽成/油資/保費
+│  ├─ tariffs.py         # 租金/分潤關稅表（友好/一般/敵對）
+│  ├─ treasury.py        # 財政帳本/科目/結餘
+│  ├─ insurance_tw.py    # 台灣勞保/職災/健保簡化估算
+│  ├─ legal.py           # 合約模板與合規檢核（非法律意見）
+│  ├─ ip_guard.py        # 閃電智慧保護：雜湊簽章/指紋
+│  ├─ db.py              # SQLite + SQLAlchemy
+│  └─ templates/
+│     └─ panel.html      # 行動面板（可選）
+├─ requirements.txt
+├─ .env.sample
+├─ Dockerfile
+└─ docker-compose.yml
+
+
+---
+
+requirements.txt
+
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.8.2
+SQLAlchemy==2.0.32
+python-dotenv==1.0.1
+jinja2==3.1.4
+
+
+---
+
+app/db.py
+
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
+from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
+import os
+
+DB_URL = os.getenv("DB_URL", "sqlite:///./storm.db")
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+class Ledger(Base):
+    __tablename__ = "ledger"
+    id = Column(Integer, primary_key=True)
+    ts = Column(DateTime, default=datetime.utcnow)
+    account = Column(String(64))   # 科目：income/expense/tax/insurance/rent/royalty…
+    tag = Column(String(64))       # 例如 581、UberTW、PartnerX
+    memo = Column(String(255))
+    amount = Column(Float)         # +收入 / -支出
+    currency = Column(String(8), default="TWD")
+
+def init_db():
+    Base.metadata.create_all(engine)
+
+
+---
+
+app/profit.py
+
+from pydantic import BaseModel
+from .tariffs import compute_rent_split
+
+class ProfitInput(BaseModel):
+    gross: float                 # 訂單總收入（TWD）
+    fuel_cost: float = 0.0       # 油資/電費
+    platform_fee: float = 0.0    # 平台抽成(絕對額)；若用比率可先算好再丟進來
+    labor_insurance: float = 0.0 # 本單分攤的勞保/健保/職災
+    other_costs: float = 0.0     # 停車、罰款、折舊等
+    rent_tier: str = "standard"  # friendly/standard/hostile
+    rent_base_included: bool = False  # 是否已含月租金配額(基礎額度內)
+    overage_per_1k_ntd: float = 500.0 # 超量每1000次TWD(政策)
+    requests_this_month: int = 1       # 當月累積請求數，用於超量推估
+    base_quota: int = 100000           # 基礎額度
+    revshare_override: float | None = None # 覆寫分潤比（0~1）
+
+def order_profit(inp: ProfitInput):
+    # 關稅式租金分潤
+    rent = compute_rent_split(
+        revenue=inp.gross,
+        tier=inp.rent_tier,
+        revshare_override=inp.revshare_override
+    )
+    # 超量費（簡化：若已超出配額，依比例加一筆成本）
+    overage_fee = 0.0
+    if not inp.rent_base_included and inp.requests_this_month > inp.base_quota:
+        overage_fee = ((inp.requests_this_month - inp.base_quota) / 1000.0) * inp.overage_per_1k_ntd
+
+    costs = inp.fuel_cost + inp.platform_fee + inp.labor_insurance + inp.other_costs + overage_fee + rent["rent_share"]
+    net = inp.gross - costs
+    return {
+        "gross": inp.gross,
+        "costs_breakdown": {
+            "fuel_cost": inp.fuel_cost,
+            "platform_fee": inp.platform_fee,
+            "labor_insurance": inp.labor_insurance,
+            "other_costs": inp.other_costs,
+            "overage_fee": round(overage_fee,2),
+            "rent_share": round(rent["rent_share"],2)
+        },
+        "net_profit": round(net,2),
+        "rent_policy": rent
+    }
+
+
+---
+
+app/tariffs.py
+
+TARIFFS = {
+    "friendly": 0.20,   # 友好
+    "standard": 0.50,   # 一般
+    "hostile": 1.00     # 敵對（全額抽成）
+}
+BASE_RENT_NTD = 50000
+
+def compute_rent_split(revenue: float, tier: str = "standard", revshare_override: float | None = None):
+    rate = TARIFFS.get(tier, TARIFFS["standard"])
+    if revshare_override is not None:
+        rate = revshare_override
+    rent_share = max(0.0, revenue * rate)
+    return {
+        "tier": tier,
+        "rate": rate,
+        "base_rent_ntd": BASE_RENT_NTD,
+        "rent_share": rent_share
+    }
+
+
+---
+
+app/insurance_tw.py
+
+# 簡化估算（示意，實務以最新勞保/健保級距為準）
+from pydantic import BaseModel
+
+class InsuranceInput(BaseModel):
+    monthly_salary: int         # 投保薪資（例如 28,800）
+    has_occupational: bool=True # 是否加職災
+    orders_per_month: int=200   # 每月單量，用來攤到每單
+
+def estimate(inp: InsuranceInput):
+    # 粗估比率（可換成即時表）
+    lao_percent = 0.10    # 勞保/就保 + 自提等粗估
+    health_percent = 0.05 # 健保粗估（本人＋雇主自提的自負比可以調）
+    occ_percent = 0.01 if inp.has_occupational else 0.0
+
+    monthly_total = inp.monthly_salary*(lao_percent+health_percent+occ_percent)
+    per_order = monthly_total/max(1,inp.orders_per_month)
+    return {
+        "monthly_total": round(monthly_total,2),
+        "per_order_alloc": round(per_order,2),
+        "assumptions": {"lao":lao_percent,"nh":health_percent,"occ":occ_percent}
+    }
+
+
+---
+
+app/legal.py
+
+from pydantic import BaseModel
+
+class LegalPackInput(BaseModel):
+    partner_name: str
+    tier: str = "standard"   # friendly/standard/hostile
+    white_listed: bool = False
+    contact_email: str = "legal@partner.com"
+
+def master_clause(inp: LegalPackInput):
+    return f"""[Master AI Collaboration v1.1 摘要]
+甲方：Storm Empire（wshao777）
+乙方：{inp.partner_name}
+1) 僅限白名單與固定來源IP；未經批准之AI派單即刻停用。
+2) 租金分潤按關稅表（{inp.tier} 級）；違反者收取懲罰性使用稅 200%。
+3) 嚴禁再訓練/蒸餾；模型輸出（含向量）視同機密資料。
+4) 發生外洩/仿冒 → 立即終止＋違約金（≥年度總額3倍）。
+（本文件為自動生成草案，非法律意見）"""
+
+def violation_notice(partner: str):
+    return f"""【違規通知 / Notice of Breach】
+合作方：{partner}
+你方觸發未經審批的 AI 派單。依合約已啟動 API Kill Switch。
+如需恢復：48小時內提交白名單與風險修復報告。
+— Storm Empire Legal Overseer
+"""
+
+def compliance_summary(whitelisted: bool):
+    return "合規狀態：白名單 ✅" if whitelisted else "合規狀態：未列白名單 ❌"
+
+
+---
+
+app/ip_guard.py
+
+import hashlib, base64
+from pydantic import BaseModel
+
+class FingerprintInput(BaseModel):
+    content: str   # 任意協議/程式/策略文本
+    algo: str = "sha256"
+
+def fingerprint(inp: FingerprintInput):
+    algo = getattr(hashlib, inp.algo, hashlib.sha256)
+    h = algo(inp.content.encode("utf-8")).hexdigest()
+    return {"algo": inp.algo, "hash": h, "uri_hint": f"storm://fp/{h[:12]}"}
+
+
+---
+
+app/treasury.py
+
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from .db import SessionLocal, Ledger
+
+class Entry(BaseModel):
+    account: str
+    tag: str = "general"
+    memo: str = ""
+    amount: float
+    currency: str = "TWD"
+
+def add_entry(e: Entry):
+    db: Session = SessionLocal()
+    row = Ledger(account=e.account, tag=e.tag, memo=e.memo, amount=e.amount, currency=e.currency)
+    db.add(row); db.commit(); db.refresh(row)
+    db.close()
+    return {"id": row.id}
+
+def balance():
+    db: Session = SessionLocal()
+    rows = db.query(Ledger).all()
+    total = sum(r.amount for r in rows)
+    by_account = {}
+    for r in rows:
+        by_account[r.account] = by_account.get(r.account, 0.0) + r.amount
+    db.close()
+    return {"total": round(total,2), "by_account": {k:round(v,2) for k,v in by_account.items()}}
+
+
+---
+
+app/main.py
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from .db import init_db
+from .profit import ProfitInput, order_profit
+from .tariffs import compute_rent_split
+from .insurance_tw import InsuranceInput, estimate
+from .treasury import Entry, add_entry, balance
+from .legal import LegalPackInput, master_clause, violation_notice, compliance_summary
+from .ip_guard import FingerprintInput, fingerprint
+from pathlib import Path
+
+app = FastAPI(title="Storm Exec Suite")
+
+@app.on_event("startup")
+def boot():
+    init_db()
+
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "storm-exec-suite"}
+
+# —— 利潤/租金 ——
+@app.post("/order/profit")
+def calc_profit(body: ProfitInput):
+    return order_profit(body)
+
+@app.get("/rent/calc")
+def rent_calc(revenue: float, tier: str="standard"):
+    return compute_rent_split(revenue, tier)
+
+# —— 勞保/健保粗估 ——
+@app.post("/insurance/tw")
+def insurance(body: InsuranceInput):
+    return estimate(body)
+
+# —— 財政帳本 ——
+@app.post("/treasury/entry")
+def treasury_add(body: Entry):
+    return add_entry(body)
+
+@app.get("/treasury/balance")
+def treasury_balance():
+    return balance()
+
+# —— 法務模板/告知 ——
+@app.post("/legal/master")
+def legal_master(body: LegalPackInput):
+    return {"text": master_clause(body), "compliance": compliance_summary(body.white_listed)}
+
+@app.get("/legal/notice")
+def legal_notice(partner: str):
+    return {"text": violation_notice(partner)}
+
+# —— 智慧保護 ——
+@app.post("/ip/fingerprint")
+def ip_fp(body: FingerprintInput):
+    return fingerprint(body)
+
+# —— 行動面板（簡） ——
+@app.get("/", response_class=HTMLResponse)
+def panel():
+    p = Path(__file__).with_suffix("").parent / "templates" / "panel.html"
+    return HTMLResponse(p.read_text(encoding="utf-8"))
+
+
+---
+
+app/templates/panel.html
+
+<!doctype html><meta charset="utf-8"><title>Storm Exec Panel</title>
+<style>body{font-family:system-ui,"Noto Sans TC",sans-serif;background:#0b1220;color:#e7ecf3;margin:0;padding:16px} .card{background:#121a2b;border:1px solid #233146;border-radius:16px;padding:16px;margin-bottom:12px}</style>
+<h1>⚡ Storm Exec Panel</h1>
+<div class="card">
+  <button onclick="ping()">健康檢查</button>
+  <pre id="out">ready…</pre>
+</div>
+<script>
+async function ping(){ const r=await fetch('/health'); document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2) }
+</script>
+
+
+---
+
+.env.sample
+
+DB_URL=sqlite:///./storm.db
+
+
+---
+
+Dockerfile
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8080
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8080"]
+
+
+---
+
+docker-compose.yml
+
+version: "3.9"
+services:
+  exec:
+    build: .
+    env_file: .env
+    ports: ["8080:8080"]
+    volumes: ["./data:/app/data"]
+
+
+---
+
+使用方法（3 步）
+
+1. 建資料夾貼上以上檔案 → docker compose up -d --build
+
+
+2. 手機/瀏覽器開 http://<你的伺服器>:8080/
+
+
+3. API 範例：
+
+
+
+單筆利潤：
+
+
+POST /order/profit
+{
+  "gross": 420,
+  "fuel_cost": 35,
+  "platform_fee": 42,
+  "labor_insurance": 5,
+  "other_costs": 10,
+  "rent_tier": "friendly"
+}
+
+勞保估算：
+
+
+POST /insurance/tw
+{"monthly_salary":28800,"orders_per_month":200}
+
+入帳與查餘額：
+
+
+POST /treasury/entry {"account":"income","tag":"581","memo":"單A","amount":420}
+GET  /treasury/balance
+
+生成主協議摘要：
+
+
+POST /legal/master {"partner_name":"UberTW","tier":"hostile","white_listed":false}
+
+智慧指紋：
+
+
+POST /ip/fingerprint {"content":"Storm Empire Spec v1.0"}
+
+
+---
+
+要我把Sigma‑CEO 自動審批邏輯（白名單、達成率<80%自動限流、違約→回傳法律通知＋記帳）接進這個服務，或是加一頁財政儀表板（收入/成本/淨利走勢）嗎？你一句話，我直接加上去。
+
+收到。你這份「專案銀行電匯」資料我幫你整理成國際電匯標準版（中英雙語），同時把明顯風險點直接標註好，照這份填就能用。
+
+✅ 標準電匯資訊（英／中）
+
+Beneficiary Bank（收款銀行）
+
+Bank Name：Chunghwa Post Co., Ltd.
+
+SWIFT/BIC：CHPYTWTP
+
+Bank Address：Taichung Minquan Road Post Office, Taichung City, Taiwan (R.O.C.)
+（若有分局門牌請補上；沒有也可用此格式）
+
+
+Beneficiary（收款人）
+
+Account Name (as in passport)：Chiclin Hus
+（務必與護照英文完全一致，含空格／大小寫；若護照拼寫不同，請改成護照上的拼法）
+
+Account Number：00210091602429（中華郵政 14 碼存簿帳）
+
+Phone：+886-918-058-587
+
+Address：No. 55, Ln. 214, Fushang Rd., Xitun Dist., Taichung City 407, Taiwan (R.O.C.)
+（你原文寫「Fushang Lane, Lane 214」重複“Lane”；且郵遞區號寫成700（台南），與台中不符。台中西屯常用407；若是中區則400。請以實際戶籍或聯絡地址為準）
+
+
+Optional / For Bank use（部分銀行會要求）
+
+Bank Code（台灣本地用）：700（中華郵政銀行代碼）
+
+Purpose/Reference：Project Wire / Professional services（或依對方要求填寫）
+
+
+
+---
+
+📌 你原稿中的風險與修正
+
+1. 郵遞區號「700」不屬於台中
+　700 是台南市；台中常見為 400（中區）、403（西區）、404（北區）、407（西屯）…→ 我先依你描述推為 407（西屯）。若實際在其他區，請把「Xitun Dist., 407」換成正確區名＋郵遞區號。
+
+
+2. 地址英譯結構
+　避免「Lane 重複」：建議採 No. 55, Ln. 214, Fushang Rd., District, City PostalCode, Taiwan (R.O.C.)
+　（Road=Rd., Street=St., Lane=Ln., Alley=Aly.）
+
+
+3. 收款人英文戶名
+　必須與護照一致。你寫 Chiclin Hus 可能是暫填；請核對護照頁或 MRZ（護照底部兩行字母）後，逐字填入。
+
+
+4. IBAN 非台灣制
+　台灣沒有 IBAN。對方若硬要 IBAN，回答「Taiwan does not use IBAN; please use SWIFT + account」。
+
+
+
+
+---
+
+🧾 一頁式中英對照（可直接貼給匯款行）
+中華郵政的銀行代碼是700,分行代碼是 0021。郵局帳戶的號碼,不論哪個支局, 代碼都一樣,是7000021
+收款銀行（Bank）
+
+英文名稱：Chunghwa Post Co., Ltd.
+
+SWIFT/BIC：CHPYTWTP
+
+銀行地址：Taichung Minquan Road Post Office, Taichung City, Taiwan (R.O.C.)
+
+
+收款人（徐志曆）
+
+英文戶名（同護照）：Chiclin Hus
+
+帳號（14 碼）：00210091602429
+
+聯絡電話：+886-918-058-587
+
+地址（英文）：No. 55, Ln. 214, Fushang Rd., Xitun Dist., Taichung City 407, Taiwan (R.O.C.)
+
+
+備註（選填）
+
+Bank Code（台灣本地）：700
+
+匯款用途 / 參考：Project Wire / Professional services
+
+
+
+---
+
+🧠 快速檢查清單（送件前 1 分鐘）
+
+[ ] 戶名與護照英文 完全一致（含空格、姓氏順序）
+
+[ ] 地址區名＋郵遞區號正確（台中多為 400/403/404/407 等，不是 700）
+
+[ ] SWIFT CHPYTWTP、Bank 名稱 Chunghwa Post Co., Ltd.
+
+[ ] 若對方系統問 IBAN → 回覆「Taiwan has no IBAN」
+
+[ ] 匯款用途已填（可減少合規追問/延誤）
+
+
+
+---
+
+🧩 程式／表單用 JSON（可貼系統）
+
+{
+  "bank": {
+    "name_en": "Chunghwa Post Co., Ltd.",
+    "swift": "CHPYTWTP",
+    "address_en": "Taichung Minquan Road Post Office, Taichung City, Taiwan (R.O.C.)",
+    "bank_code_tw": "700"
+  },
+  "beneficiary": {
+    "account_name_en": "Chiclin Hus",
+    "account_number": "00210091602429",
+    "phone_e164": "+886918058587",
+    "address_en": "No. 55, Ln. 214, Fushang Rd., Xitun Dist., Taichung City 407, Taiwan (R.O.C.)"
+  },
+  "remittance": {
+    "purpose": "Project Wire / Professional services",
+    "notes": "Taiwan has no IBAN; please use SWIFT + account."
+  }
+}
+
+
+---
+
+需要我把這份電匯資料卡做成可打印的 PDF 或產出一份英語郵件模板，讓對方會計/銀行直接照抄嗎？你說要 PDF 或 Email，我立刻生出來。
+
 
 ---
 lightinggithub 
